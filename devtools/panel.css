@@ -1,0 +1,273 @@
+/* ─── DevTools Panel — Chromium DevTools-styled ──────────────────────────── */
+
+:root {
+    --dt-bg: #1e1e2e;
+    --dt-bg-alt: #252536;
+    --dt-bg-hover: #2a2a3d;
+    --dt-bg-selected: #2d2d44;
+    --dt-border: #3a3a50;
+    --dt-text: #cdd6f4;
+    --dt-text-dim: #6c7086;
+    --dt-accent: #89b4fa;
+    --dt-green: #a6e3a1;
+    --dt-red: #f38ba8;
+    --dt-yellow: #f9e2af;
+    --dt-orange: #fab387;
+    --dt-purple: #cba6f7;
+    --dt-toolbar-bg: #181825;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Consolas, monospace;
+    font-size: 12px;
+    background: var(--dt-bg);
+    color: var(--dt-text);
+    height: 100vh;
+    overflow: hidden;
+}
+
+.panel-container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+}
+
+/* ─── Toolbar ────────────────────────────────────────────────────────── */
+
+.toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 8px;
+    background: var(--dt-toolbar-bg);
+    border-bottom: 1px solid var(--dt-border);
+    gap: 8px;
+    flex-shrink: 0;
+}
+
+.toolbar-left,
+.toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.tool-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--dt-text-dim);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+.tool-btn:hover {
+    background: var(--dt-bg-hover);
+    color: var(--dt-text);
+}
+
+.tool-btn.recording {
+    color: var(--dt-red);
+}
+
+.separator {
+    width: 1px;
+    height: 18px;
+    background: var(--dt-border);
+    margin: 0 4px;
+}
+
+.info-text {
+    color: var(--dt-text-dim);
+    font-size: 11px;
+    padding: 0 4px;
+}
+
+.info-text.recording {
+    color: var(--dt-red);
+}
+
+.filter-input {
+    background: var(--dt-bg);
+    border: 1px solid var(--dt-border);
+    border-radius: 4px;
+    color: var(--dt-text);
+    padding: 4px 8px;
+    font-size: 11px;
+    font-family: inherit;
+    width: 200px;
+    outline: none;
+    transition: border-color 0.2s;
+}
+
+.filter-input:focus {
+    border-color: var(--dt-accent);
+}
+
+.request-count {
+    color: var(--dt-text-dim);
+    font-size: 11px;
+    padding: 2px 8px;
+    background: var(--dt-bg);
+    border-radius: 10px;
+    border: 1px solid var(--dt-border);
+    white-space: nowrap;
+}
+
+/* ─── Request Table ──────────────────────────────────────────────────── */
+
+.table-wrapper {
+    flex: 1;
+    overflow: auto;
+}
+
+.request-table {
+    width: 100%;
+    border-collapse: collapse;
+    table-layout: fixed;
+}
+
+.request-table thead {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+}
+
+.request-table th {
+    background: var(--dt-bg-alt);
+    border-bottom: 1px solid var(--dt-border);
+    border-right: 1px solid var(--dt-border);
+    padding: 4px 8px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 11px;
+    color: var(--dt-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    user-select: none;
+}
+
+.request-table td {
+    padding: 3px 8px;
+    border-bottom: 1px solid rgba(58, 58, 80, 0.4);
+    border-right: 1px solid rgba(58, 58, 80, 0.2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+}
+
+.request-table tbody tr:hover {
+    background: var(--dt-bg-hover);
+}
+
+.request-table tbody tr.error {
+    color: var(--dt-red);
+}
+
+.col-method {
+    width: 60px;
+}
+
+.col-status {
+    width: 55px;
+}
+
+.col-url {
+    width: auto;
+}
+
+.col-type {
+    width: 80px;
+}
+
+.col-size {
+    width: 70px;
+    text-align: right;
+}
+
+.col-time {
+    width: 65px;
+    text-align: right;
+}
+
+/* Status colors */
+.status-2xx {
+    color: var(--dt-green);
+}
+
+.status-3xx {
+    color: var(--dt-yellow);
+}
+
+.status-4xx {
+    color: var(--dt-orange);
+}
+
+.status-5xx {
+    color: var(--dt-red);
+}
+
+.status-0 {
+    color: var(--dt-text-dim);
+}
+
+/* Method badge */
+.method-badge {
+    font-weight: 700;
+    font-size: 10px;
+    padding: 1px 4px;
+    border-radius: 3px;
+    text-transform: uppercase;
+}
+
+.method-GET {
+    color: var(--dt-green);
+}
+
+.method-POST {
+    color: var(--dt-accent);
+}
+
+.method-PUT {
+    color: var(--dt-yellow);
+}
+
+.method-DELETE {
+    color: var(--dt-red);
+}
+
+.method-PATCH {
+    color: var(--dt-purple);
+}
+
+/* ─── Empty State ────────────────────────────────────────────────────── */
+
+.empty-state td {
+    text-align: center;
+    padding: 60px 20px;
+    border: none;
+}
+
+.empty-content {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+}
+
+.empty-content p {
+    color: var(--dt-text-dim);
+    font-size: 12px;
+}

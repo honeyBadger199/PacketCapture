@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>HAR Capture Panel</title>
+    <link rel="stylesheet" href="panel.css">
+</head>
+
+<body>
+    <div class="panel-container">
+        <!-- Toolbar -->
+        <div class="toolbar">
+            <div class="toolbar-left">
+                <button class="tool-btn" id="recordBtn" title="Start Recording">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                        <circle cx="12" cy="12" r="8" />
+                    </svg>
+                </button>
+                <button class="tool-btn" id="clearBtn" title="Clear">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10" />
+                        <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+                    </svg>
+                </button>
+                <button class="tool-btn" id="exportBtn" title="Export HAR">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                        <polyline points="7,10 12,15 17,10" />
+                        <line x1="12" y1="15" x2="12" y2="3" />
+                    </svg>
+                </button>
+                <div class="separator"></div>
+                <span class="info-text" id="statusInfo">Idle</span>
+            </div>
+            <div class="toolbar-right">
+                <input type="text" class="filter-input" id="filterInput" placeholder="Filter by URL...">
+                <span class="request-count" id="requestCountBadge">0 requests</span>
+            </div>
+        </div>
+
+        <!-- Request Table -->
+        <div class="table-wrapper">
+            <table class="request-table">
+                <thead>
+                    <tr>
+                        <th class="col-method">Method</th>
+                        <th class="col-status">Status</th>
+                        <th class="col-url">URL</th>
+                        <th class="col-type">Type</th>
+                        <th class="col-size">Size</th>
+                        <th class="col-time">Time</th>
+                    </tr>
+                </thead>
+                <tbody id="requestTableBody">
+                    <tr class="empty-state">
+                        <td colspan="6">
+                            <div class="empty-content">
+                                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#555"
+                                    stroke-width="1.5">
+                                    <circle cx="12" cy="12" r="10" />
+                                    <line x1="12" y1="8" x2="12" y2="12" />
+                                    <circle cx="12" cy="15" r="0.5" fill="#555" />
+                                </svg>
+                                <p>Click the record button to start capturing network traffic</p>
+                            </div>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script src="panel.js"></script>
+</body>
+
+</html>
