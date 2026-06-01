@@ -1,0 +1,62 @@
+{
+  "iterations": 100,
+  "start_iteration": 49,
+  "timing": {
+    "online_session_seconds": 120,
+    "reconnect_delay_seconds": 10,
+    "tcpdump_startup_timeout_seconds": 20,
+    "tcpdump_shutdown_timeout_seconds": 15,
+    "pcap_settle_timeout_seconds": 20,
+    "pcap_settle_poll_seconds": 2,
+    "browser_navigation_timeout_seconds": 30000
+  },
+  "vm": {
+    "host": "168.144.25.166",
+    "port": 22,
+    "username": "root",
+    "password": "onlinessh@123IITD",
+    "private_key_path": null,
+    "private_key_passphrase": null,
+    "look_for_keys": false,
+    "allow_agent": false,
+    "sudo_password": "onlinessh@123IITD",
+    "remote_capture_dir": "/tmp/packet_captures",
+    "tmux_session_template": "online_ssh_capture_{iteration:02d}_{timestamp}"
+  },
+  "capture": {
+    "interface": "any",
+    "require_sudo": true,
+    "remote_pcap_template": "capture5_{iteration:03d}.pcap",
+    "extra_args": [],
+    "bpf_filter": "port 22 or port 80"
+  },
+  "online_ssh": {
+    "browser_name": "firefox",
+    "base_url": "https://www.ssheasy.com",
+    "connect_path": "/connect",
+    "headless": true,
+    "browser_executable": null,
+    "ignore_https_errors": true,
+    "post_connect_delay_seconds": 5,
+    "target": {
+      "host": "168.144.25.166",
+      "port": 22,
+      "user": "root",
+      "password": "onlinessh@123IITD"
+    },
+    "page_ready_selector": null,
+    "connect_button_selector": null,
+    "accept_host_key_selector": null,
+    "disconnect_button_selector": null
+  },
+  "local": {
+    "download_dir": "pcaps",
+    "public_ip_log_file": "pcaps/public_ip_log.txt",
+    "public_ip_lookup_urls": [
+      "https://api.ipify.org?format=json",
+      "https://checkip.amazonaws.com",
+      "https://ifconfig.me/ip"
+    ],
+    "remove_remote_after_download": false
+  }
+}
