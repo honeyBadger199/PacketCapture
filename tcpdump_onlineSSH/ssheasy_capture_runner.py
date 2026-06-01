@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Automate tcpdump capture around an SSHEasy browser session."""
+"""Automate tcpdump capture around a WebSSH browser session."""
 
 import argparse
+import base64
 import ipaddress
 import json
 import logging
@@ -9,20 +10,16 @@ import os
 import posixpath
 import re
 import shlex
+import shutil
+import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode, urljoin
 from urllib.request import urlopen
-
-try:
-    import paramiko
-except ImportError as exc:  # pragma: no cover - import guard
-    raise SystemExit(
-        "Missing dependency 'paramiko'. Install it with: pip install paramiko"
-    ) from exc
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -35,14 +32,110 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 LOG = logging.getLogger("ssheasy-capture")
 
+CONNECT_URL_STYLE_ALIASES = {
+    "connect_params": "connect_params",
+    "ssheasy": "connect_params",
+    "webssh_query": "webssh_query",
+    "webssh": "webssh_query",
+    "webhorizon": "webssh_query",
+}
+
 
 class ConfigError(RuntimeError):
     """Raised when the JSON config is incomplete or invalid."""
 
 
+@dataclass(frozen=True)
+class SSHTransport:
+    """Resolved SSH transport details for subprocess-based OpenSSH calls."""
+
+    host: str
+    port: int
+    username: str
+    password: Optional[str]
+    private_key_path: Optional[Path]
+    private_key_passphrase: Optional[str]
+    connect_timeout_seconds: int
+    look_for_keys: bool
+    allow_agent: bool
+
+    @property
+    def remote(self) -> str:
+        return f"{self.username}@{self.host}"
+
+    @property
+    def uses_password_auth(self) -> bool:
+        return bool(self.password and not self.private_key_path)
+
+    @property
+    def uses_sshpass(self) -> bool:
+        return bool(
+            self.uses_password_auth
+            or (self.private_key_path and self.private_key_passphrase)
+        )
+
+    def sshpass_prefix(self) -> list[str]:
+        if self.private_key_path and self.private_key_passphrase:
+            return ["sshpass", "-P", "Enter passphrase", "-p", self.private_key_passphrase]
+        if self.uses_password_auth:
+            return ["sshpass", "-p", self.password or ""]
+        return []
+
+    def shared_ssh_options(self) -> list[str]:
+        options = [
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            f"ConnectTimeout={self.connect_timeout_seconds}",
+        ]
+
+        if not self.allow_agent:
+            options.extend(["-o", "IdentityAgent=none"])
+
+        if self.private_key_path:
+            options.extend(["-i", str(self.private_key_path)])
+            options.extend(["-o", "PreferredAuthentications=publickey"])
+            if not self.look_for_keys:
+                options.extend(["-o", "IdentitiesOnly=yes"])
+        elif self.uses_password_auth:
+            options.extend(["-o", "PreferredAuthentications=password,keyboard-interactive"])
+            options.extend(["-o", "PubkeyAuthentication=no"])
+            options.extend(["-o", "NumberOfPasswordPrompts=1"])
+        elif not self.look_for_keys:
+            options.extend(["-o", "PubkeyAuthentication=no"])
+
+        if not self.uses_sshpass:
+            options.extend(["-o", "BatchMode=yes"])
+
+        return options
+
+    def build_ssh_command(self, remote_command: str, *, get_pty: bool = False) -> list[str]:
+        command = [*self.sshpass_prefix(), "ssh", *self.shared_ssh_options(), "-p", str(self.port)]
+        if get_pty:
+            command.append("-tt")
+        command.extend([self.remote, remote_command])
+        return command
+
+    def build_scp_command(self, remote_path: str, local_path: Path) -> list[str]:
+        remote_spec = f"{self.remote}:{shell_quote(remote_path)}"
+        return [
+            *self.sshpass_prefix(),
+            "scp",
+            *self.shared_ssh_options(),
+            "-P",
+            str(self.port),
+            remote_spec,
+            str(local_path),
+        ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run repeated tcpdump captures around an SSHEasy session."
+        description="Run repeated tcpdump captures around a WebSSH session."
     )
     parser.add_argument(
         "--config",
@@ -58,7 +151,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--headful",
         action="store_true",
-        help="Run Chromium visibly instead of using headless mode.",
+        help="Run the browser visibly instead of using headless mode.",
     )
     return parser.parse_args()
 
@@ -90,6 +183,24 @@ def resolve_local_path(config_dir: Path, value: Optional[str]) -> Optional[Path]
 
 def shell_quote(value: str) -> str:
     return shlex.quote(value)
+
+
+def get_connect_url_style(online_ssh: Dict[str, Any]) -> str:
+    configured_style = str(online_ssh.get("url_style", "connect_params")).strip().lower()
+    style = CONNECT_URL_STYLE_ALIASES.get(configured_style)
+    if style is None:
+        supported = ", ".join(sorted(CONNECT_URL_STYLE_ALIASES))
+        raise ConfigError(
+            f"Unsupported online_ssh.url_style: {configured_style}. "
+            f"Use one of: {supported}."
+        )
+    return style
+
+
+def get_default_connect_path(url_style: str) -> str:
+    if url_style == "webssh_query":
+        return "/"
+    return "/connect"
 
 
 def build_connect_target(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -139,12 +250,16 @@ def validate_config(config: Dict[str, Any], config_dir: Path) -> None:
         raise ConfigError(
             "Set either vm.password or vm.private_key_path for the direct SSH login."
         )
+    if vm.get("private_key_passphrase") and not vm.get("private_key_path"):
+        raise ConfigError(
+            "vm.private_key_passphrase requires vm.private_key_path to be set."
+        )
 
     if online_ssh.get("connect_url"):
         require(online_ssh, "connect_url", "online_ssh")
     else:
         require(online_ssh, "base_url", "online_ssh")
-        require(online_ssh, "connect_path", "online_ssh")
+        get_connect_url_style(online_ssh)
 
     build_connect_target(config)
 
@@ -185,88 +300,129 @@ def validate_config(config: Dict[str, Any], config_dir: Path) -> None:
         raise ConfigError("local.public_ip_lookup_urls must be a list of URLs.")
 
 
-def build_ssh_client(config: Dict[str, Any], config_dir: Path) -> paramiko.SSHClient:
+def build_ssh_transport(config: Dict[str, Any], config_dir: Path) -> SSHTransport:
     vm = config["vm"]
-    password = vm.get("password")
-    private_key_path = resolve_local_path(config_dir, vm.get("private_key_path"))
-    passphrase = vm.get("private_key_passphrase")
+    return SSHTransport(
+        host=str(vm["host"]),
+        port=int(vm.get("port", 22)),
+        username=str(vm["username"]),
+        password=vm.get("password"),
+        private_key_path=resolve_local_path(config_dir, vm.get("private_key_path")),
+        private_key_passphrase=vm.get("private_key_passphrase"),
+        connect_timeout_seconds=int(vm.get("connect_timeout_seconds", 20)),
+        look_for_keys=bool(vm.get("look_for_keys", False)),
+        allow_agent=bool(vm.get("allow_agent", False)),
+    )
 
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    connect_kwargs = {
-        "hostname": vm["host"],
-        "port": int(vm.get("port", 22)),
-        "username": vm["username"],
-        "timeout": int(vm.get("connect_timeout_seconds", 20)),
-        "banner_timeout": int(vm.get("banner_timeout_seconds", 30)),
-        "auth_timeout": int(vm.get("auth_timeout_seconds", 30)),
-        "look_for_keys": bool(vm.get("look_for_keys", False)),
-        "allow_agent": bool(vm.get("allow_agent", False)),
-    }
-    if password:
-        connect_kwargs["password"] = password
-    if private_key_path:
-        connect_kwargs["key_filename"] = str(private_key_path)
-    if passphrase:
-        connect_kwargs["passphrase"] = passphrase
+def ensure_local_ssh_dependencies(ssh_transport: SSHTransport) -> None:
+    for binary in ("ssh", "scp"):
+        if shutil.which(binary) is None:
+            raise RuntimeError(
+                f"Missing local dependency '{binary}'. Install OpenSSH client tools."
+            )
 
-    client.connect(**connect_kwargs)
-    return client
+    if ssh_transport.uses_sshpass and shutil.which("sshpass") is None:
+        raise RuntimeError(
+            "Missing local dependency 'sshpass'. Install sshpass for password-based "
+            "direct SSH control, or switch vm.private_key_path to key-based auth."
+        )
+
+
+def run_local_command(
+    command: list[str],
+    *,
+    description: str,
+    check: bool = True,
+    timeout: Optional[int] = None,
+) -> Tuple[str, str, int]:
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        raise RuntimeError(
+            f"{description} timed out after {timeout} seconds.\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+        ) from exc
+
+    stdout = completed.stdout
+    stderr = completed.stderr
+    if check and completed.returncode != 0:
+        extra_hint = ""
+        if completed.returncode == 255 and command:
+            command_name = Path(command[0]).name
+            if command_name in {"ssh", "scp", "sshpass"}:
+                extra_hint = (
+                    "\nHint: exit 255 from OpenSSH usually means the SSH connection "
+                    "or authentication failed before the remote command ran."
+                )
+        raise RuntimeError(
+            f"{description} failed (exit {completed.returncode}).\n"
+            f"stdout:\n{stdout}\n"
+            f"stderr:\n{stderr}"
+            f"{extra_hint}"
+        )
+    return stdout, stderr, completed.returncode
 
 
 def exec_remote(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     command: str,
     *,
     check: bool = True,
     get_pty: bool = False,
     timeout: Optional[int] = None,
+    description: Optional[str] = None,
 ) -> Tuple[str, str, int]:
-    stdin, stdout, stderr = ssh_client.exec_command(
-        command,
-        get_pty=get_pty,
+    return run_local_command(
+        ssh_transport.build_ssh_command(command, get_pty=get_pty),
+        description=description or f"Remote command failed: {command}",
+        check=check,
         timeout=timeout,
     )
-    output = stdout.read().decode("utf-8", errors="replace")
-    error = stderr.read().decode("utf-8", errors="replace")
-    exit_code = stdout.channel.recv_exit_status()
-
-    if check and exit_code != 0:
-        raise RuntimeError(
-            f"Remote command failed (exit {exit_code}): {command}\n"
-            f"stdout:\n{output}\n"
-            f"stderr:\n{error}"
-        )
-    return output, error, exit_code
 
 
 def tmux_send_literal(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     session_name: str,
     text: str,
     *,
     press_enter: bool = True,
+    sensitive: bool = False,
 ) -> None:
     exec_remote(
-        ssh_client,
+        ssh_transport,
         "tmux send-keys -t {session} -l {text}".format(
             session=shell_quote(session_name),
             text=shell_quote(text),
         ),
+        description=(
+            "Remote command failed: tmux send-keys <redacted>"
+            if sensitive
+            else None
+        ),
     )
     if press_enter:
         exec_remote(
-            ssh_client,
+            ssh_transport,
             "tmux send-keys -t {session} Enter".format(
                 session=shell_quote(session_name)
             ),
         )
 
 
-def capture_tmux_pane(ssh_client: paramiko.SSHClient, session_name: str) -> str:
+def capture_tmux_pane(ssh_transport: SSHTransport, session_name: str) -> str:
     output, _, _ = exec_remote(
-        ssh_client,
+        ssh_transport,
         "tmux capture-pane -p -t {session} -S -50".format(
             session=shell_quote(session_name)
         ),
@@ -275,9 +431,9 @@ def capture_tmux_pane(ssh_client: paramiko.SSHClient, session_name: str) -> str:
     return output
 
 
-def tmux_session_exists(ssh_client: paramiko.SSHClient, session_name: str) -> bool:
+def tmux_session_exists(ssh_transport: SSHTransport, session_name: str) -> bool:
     _, _, exit_code = exec_remote(
-        ssh_client,
+        ssh_transport,
         "tmux has-session -t {session}".format(session=shell_quote(session_name)),
         check=False,
     )
@@ -363,7 +519,7 @@ def build_tmux_session_name(
 
 
 def start_tcpdump(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     config: Dict[str, Any],
     *,
     iteration: int,
@@ -377,15 +533,16 @@ def start_tcpdump(
     )
 
     exec_remote(
-        ssh_client, "mkdir -p {path}".format(path=shell_quote(remote_dir))
+        ssh_transport, "mkdir -p {path}".format(path=shell_quote(remote_dir))
     )
     exec_remote(
-        ssh_client, "tmux new-session -d -s {session}".format(session=shell_quote(session_name))
+        ssh_transport,
+        "tmux new-session -d -s {session}".format(session=shell_quote(session_name)),
     )
     time.sleep(1)
 
     tcpdump_command = build_tcpdump_command(config, remote_pcap_path)
-    tmux_send_literal(ssh_client, session_name, tcpdump_command)
+    tmux_send_literal(ssh_transport, session_name, tcpdump_command)
 
     sudo_password = config["vm"].get("sudo_password")
     require_sudo = bool(config["capture"].get("require_sudo", True))
@@ -393,7 +550,7 @@ def start_tcpdump(
 
     deadline = time.time() + startup_timeout
     while time.time() < deadline:
-        pane_output = capture_tmux_pane(ssh_client, session_name).lower()
+        pane_output = capture_tmux_pane(ssh_transport, session_name).lower()
         if "listening on" in pane_output:
             LOG.info("tcpdump is running in tmux session %s", session_name)
             return session_name, remote_pcap_path
@@ -403,7 +560,12 @@ def start_tcpdump(
             and not sent_sudo_password
             and any(marker in pane_output for marker in ("password", "[sudo]"))
         ):
-            tmux_send_literal(ssh_client, session_name, str(sudo_password))
+            tmux_send_literal(
+                ssh_transport,
+                session_name,
+                str(sudo_password),
+                sensitive=True,
+            )
             sent_sudo_password = True
             time.sleep(1)
             continue
@@ -421,21 +583,21 @@ def start_tcpdump(
                 "tcpdump failed to start in tmux session "
                 f"{session_name}. tmux output:\n{pane_output}"
             )
-        if not tmux_session_exists(ssh_client, session_name):
+        if not tmux_session_exists(ssh_transport, session_name):
             raise RuntimeError(f"tmux session {session_name} exited unexpectedly.")
         time.sleep(1)
 
     raise RuntimeError(
         "Timed out waiting for tcpdump to start. Last tmux output:\n"
-        f"{capture_tmux_pane(ssh_client, session_name)}"
+        f"{capture_tmux_pane(ssh_transport, session_name)}"
     )
 
 def find_matching_tcpdump_processes(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     remote_pcap_path: str,
 ) -> list[str]:
     output, _, _ = exec_remote(
-        ssh_client,
+        ssh_transport,
         "pgrep -af tcpdump",
         check=False,
     )
@@ -448,13 +610,13 @@ def find_matching_tcpdump_processes(
 
 
 def signal_matching_tcpdump_processes(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     remote_pcap_path: str,
     signal_name: str,
 ) -> None:
     regex_pattern = re.escape(remote_pcap_path)
     exec_remote(
-        ssh_client,
+        ssh_transport,
         "pkill -{signal_name} -f {pattern}".format(
             signal_name=signal_name,
             pattern=shell_quote(regex_pattern),
@@ -463,16 +625,16 @@ def signal_matching_tcpdump_processes(
     )
 
 
-def get_remote_file_size(ssh_client: paramiko.SSHClient, remote_path: str) -> int:
+def get_remote_file_size(ssh_transport: SSHTransport, remote_path: str) -> int:
     output, _, _ = exec_remote(
-        ssh_client,
+        ssh_transport,
         "stat -c %s {path}".format(path=shell_quote(remote_path)),
     )
     return int(output.strip())
 
 
 def wait_for_remote_pcap_to_settle(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     remote_pcap_path: str,
     config: Dict[str, Any],
 ) -> int:
@@ -487,8 +649,8 @@ def wait_for_remote_pcap_to_settle(
     deadline = time.time() + settle_timeout
 
     while time.time() < deadline:
-        matching_processes = find_matching_tcpdump_processes(ssh_client, remote_pcap_path)
-        current_size = get_remote_file_size(ssh_client, remote_pcap_path)
+        matching_processes = find_matching_tcpdump_processes(ssh_transport, remote_pcap_path)
+        current_size = get_remote_file_size(ssh_transport, remote_pcap_path)
 
         if current_size == last_size:
             stable_reads += 1
@@ -502,7 +664,7 @@ def wait_for_remote_pcap_to_settle(
 
         time.sleep(poll_interval)
 
-    remaining_processes = find_matching_tcpdump_processes(ssh_client, remote_pcap_path)
+    remaining_processes = find_matching_tcpdump_processes(ssh_transport, remote_pcap_path)
     raise RuntimeError(
         "Remote pcap did not settle before download. "
         f"active_tcpdump_processes={remaining_processes} "
@@ -515,12 +677,12 @@ def build_remote_snapshot_path(remote_pcap_path: str) -> str:
 
 
 def create_remote_download_snapshot(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     remote_pcap_path: str,
 ) -> str:
     snapshot_path = build_remote_snapshot_path(remote_pcap_path)
     exec_remote(
-        ssh_client,
+        ssh_transport,
         "cp -f {source} {target}".format(
             source=shell_quote(remote_pcap_path),
             target=shell_quote(snapshot_path),
@@ -530,7 +692,7 @@ def create_remote_download_snapshot(
 
 
 def stop_tcpdump(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     session_name: str,
     remote_pcap_path: str,
     config: Dict[str, Any],
@@ -543,9 +705,9 @@ def stop_tcpdump(
     start_time = time.time()
     deadline = start_time + shutdown_timeout
 
-    if tmux_session_exists(ssh_client, session_name):
+    if tmux_session_exists(ssh_transport, session_name):
         exec_remote(
-            ssh_client,
+            ssh_transport,
             "tmux send-keys -t {session} C-c".format(session=shell_quote(session_name)),
             check=False,
         )
@@ -553,10 +715,10 @@ def stop_tcpdump(
         LOG.warning("tmux session %s no longer exists while stopping tcpdump", session_name)
 
     while time.time() < deadline:
-        matching_processes = find_matching_tcpdump_processes(ssh_client, remote_pcap_path)
+        matching_processes = find_matching_tcpdump_processes(ssh_transport, remote_pcap_path)
         if not matching_processes:
             exec_remote(
-                ssh_client,
+                ssh_transport,
                 "tmux kill-session -t {session}".format(session=shell_quote(session_name)),
                 check=False,
             )
@@ -565,25 +727,25 @@ def stop_tcpdump(
 
         elapsed = time.time() - start_time
         if elapsed >= 3 and not sent_int:
-            signal_matching_tcpdump_processes(ssh_client, remote_pcap_path, "INT")
+            signal_matching_tcpdump_processes(ssh_transport, remote_pcap_path, "INT")
             sent_int = True
         if elapsed >= 8 and not sent_term:
-            signal_matching_tcpdump_processes(ssh_client, remote_pcap_path, "TERM")
+            signal_matching_tcpdump_processes(ssh_transport, remote_pcap_path, "TERM")
             sent_term = True
         time.sleep(1)
 
-    signal_matching_tcpdump_processes(ssh_client, remote_pcap_path, "KILL")
+    signal_matching_tcpdump_processes(ssh_transport, remote_pcap_path, "KILL")
     time.sleep(1)
-    remaining_processes = find_matching_tcpdump_processes(ssh_client, remote_pcap_path)
+    remaining_processes = find_matching_tcpdump_processes(ssh_transport, remote_pcap_path)
     exec_remote(
-        ssh_client,
+        ssh_transport,
         "tmux kill-session -t {session}".format(session=shell_quote(session_name)),
         check=False,
     )
     if remaining_processes:
         pane_output = (
-            capture_tmux_pane(ssh_client, session_name)
-            if tmux_session_exists(ssh_client, session_name)
+            capture_tmux_pane(ssh_transport, session_name)
+            if tmux_session_exists(ssh_transport, session_name)
             else ""
         )
         raise RuntimeError(
@@ -594,16 +756,17 @@ def stop_tcpdump(
     LOG.info("Stopped remote tcpdump for %s after forced termination", remote_pcap_path)
 
 
-def remote_preflight(ssh_client: paramiko.SSHClient) -> None:
+def remote_preflight(ssh_transport: SSHTransport) -> None:
+    ensure_local_ssh_dependencies(ssh_transport)
     for binary in ("tmux", "tcpdump"):
         exec_remote(
-            ssh_client,
+            ssh_transport,
             "command -v {binary}".format(binary=shell_quote(binary)),
         )
 
 
 def download_remote_pcap(
-    ssh_client: paramiko.SSHClient,
+    ssh_transport: SSHTransport,
     remote_pcap_path: str,
     local_dir: Path,
     remove_remote: bool,
@@ -617,23 +780,28 @@ def download_remote_pcap(
     always_remove_remote_paths = always_remove_remote_paths or []
     remove_remote_after_download_paths = remove_remote_after_download_paths or []
 
-    sftp = ssh_client.open_sftp()
-    try:
-        sftp.stat(remote_pcap_path)
-        sftp.get(remote_pcap_path, str(local_path))
-        for remote_path in always_remove_remote_paths:
-            try:
-                sftp.remove(remote_path)
-            except FileNotFoundError:
-                pass
-        if remove_remote:
-            for remote_path in remove_remote_after_download_paths:
-                try:
-                    sftp.remove(remote_path)
-                except FileNotFoundError:
-                    pass
-    finally:
-        sftp.close()
+    exec_remote(
+        ssh_transport,
+        "test -f {path}".format(path=shell_quote(remote_pcap_path)),
+    )
+    run_local_command(
+        ssh_transport.build_scp_command(remote_pcap_path, local_path),
+        description=f"Remote copy failed for {remote_pcap_path}",
+    )
+
+    for remote_path in always_remove_remote_paths:
+        exec_remote(
+            ssh_transport,
+            "rm -f {path}".format(path=shell_quote(remote_path)),
+            check=False,
+        )
+    if remove_remote:
+        for remote_path in remove_remote_after_download_paths:
+            exec_remote(
+                ssh_transport,
+                "rm -f {path}".format(path=shell_quote(remote_path)),
+                check=False,
+            )
 
     return local_path
 
@@ -706,17 +874,34 @@ def build_connect_url(config: Dict[str, Any]) -> str:
     if online_ssh.get("connect_url"):
         return str(online_ssh["connect_url"])
 
+    url_style = get_connect_url_style(online_ssh)
     base_url = str(online_ssh["base_url"]).rstrip("/") + "/"
-    connect_path = str(online_ssh.get("connect_path", "/connect")).lstrip("/")
+    connect_path = str(
+        online_ssh.get("connect_path") or get_default_connect_path(url_style)
+    ).lstrip("/")
     connect_url = urljoin(base_url, connect_path)
-    query = urlencode(
-        {
-            "host": target["host"],
-            "port": target["port"],
-            "user": target["user"],
-            "password": target["password"],
-        }
-    )
+
+    if url_style == "webssh_query":
+        password = base64.b64encode(
+            str(target["password"]).encode("utf-8")
+        ).decode("ascii")
+        query = urlencode(
+            {
+                "hostname": target["host"],
+                "port": target["port"],
+                "username": target["user"],
+                "password": password,
+            }
+        )
+    else:
+        query = urlencode(
+            {
+                "host": target["host"],
+                "port": target["port"],
+                "user": target["user"],
+                "password": target["password"],
+            }
+        )
     return f"{connect_url}?{query}"
 
 
@@ -808,9 +993,7 @@ def launch_browser(
         f"{label}: {exc}"
         for label, exc in errors
     ]
-    raise RuntimeError(
-        "Unable to launch Chromium.\n" + "\n".join(failure_lines)
-    )
+    raise RuntimeError("Unable to launch browser.\n" + "\n".join(failure_lines))
 
 
 def run_online_ssh_session(config: Dict[str, Any], config_dir: Path, headful: bool) -> None:
@@ -826,7 +1009,7 @@ def run_online_ssh_session(config: Dict[str, Any], config_dir: Path, headful: bo
 
     connect_target = build_connect_target(config)
     LOG.info(
-        "Opening SSHEasy for %s@%s:%s",
+        "Opening WebSSH for %s@%s:%s",
         connect_target["user"],
         connect_target["host"],
         connect_target["port"],
@@ -853,7 +1036,7 @@ def run_online_ssh_session(config: Dict[str, Any], config_dir: Path, headful: bo
 
             wait_for_selector(page, online_ssh.get("page_ready_selector"), timeout_ms)
 
-            # SSHEasy can require an explicit Connect click and/or host-key acceptance.
+            # WebSSH can require an explicit Connect click and/or host-key acceptance.
             for _ in range(3):
                 clicked_connect = maybe_click(
                     page, online_ssh.get("connect_button_selector"), 2000
@@ -888,21 +1071,18 @@ def best_effort_cleanup(
     config: Dict[str, Any],
     config_dir: Path,
     session_name: Optional[str],
+    remote_pcap_path: Optional[str],
 ) -> None:
-    if not session_name:
+    if not session_name or not remote_pcap_path:
         return
 
     LOG.warning("Attempting to clean up tmux session %s", session_name)
-    client = None
     try:
-        client = build_ssh_client(config, config_dir)
-        if tmux_session_exists(client, session_name):
-            stop_tcpdump(client, session_name, config)
+        ssh_transport = build_ssh_transport(config, config_dir)
+        if tmux_session_exists(ssh_transport, session_name):
+            stop_tcpdump(ssh_transport, session_name, remote_pcap_path, config)
     except Exception as exc:  # pragma: no cover - cleanup only
         LOG.warning("Best-effort cleanup failed: %s", exc)
-    finally:
-        if client is not None:
-            client.close()
 
 
 def run_iteration(
@@ -922,24 +1102,21 @@ def run_iteration(
     LOG.info("Starting iteration %s/%s", iteration, total_iterations)
     record_public_ip(config, config_dir, iteration)
 
+    ssh_transport = build_ssh_transport(config, config_dir)
     session_name = None
     remote_pcap_path = None
-    first_client = build_ssh_client(config, config_dir)
-    try:
-        remote_preflight(first_client)
-        session_name, remote_pcap_path = start_tcpdump(
-            first_client,
-            config,
-            iteration=iteration,
-            timestamp=timestamp,
-        )
-        LOG.info(
-            "Started remote capture at %s in tmux session %s",
-            remote_pcap_path,
-            session_name,
-        )
-    finally:
-        first_client.close()
+    remote_preflight(ssh_transport)
+    session_name, remote_pcap_path = start_tcpdump(
+        ssh_transport,
+        config,
+        iteration=iteration,
+        timestamp=timestamp,
+    )
+    LOG.info(
+        "Started remote capture at %s in tmux session %s",
+        remote_pcap_path,
+        session_name,
+    )
 
     try:
         LOG.info("Disconnected from the VM and leaving tcpdump running in tmux")
@@ -949,31 +1126,27 @@ def run_iteration(
             LOG.info("Waiting %s seconds before reconnecting to the VM", reconnect_delay)
             time.sleep(reconnect_delay)
 
-        second_client = build_ssh_client(config, config_dir)
-        try:
-            if session_name is None or remote_pcap_path is None:
-                raise RuntimeError("tcpdump session state was not initialized.")
-            stop_tcpdump(second_client, session_name, remote_pcap_path, config)
-            wait_for_remote_pcap_to_settle(second_client, remote_pcap_path, config)
-            remote_snapshot_path = create_remote_download_snapshot(
-                second_client,
-                remote_pcap_path,
-            )
-            local_path = download_remote_pcap(
-                second_client,
-                remote_snapshot_path,
-                local_dir,
-                bool(config["local"].get("remove_remote_after_download", False)),
-                local_filename=Path(remote_pcap_path).name,
-                always_remove_remote_paths=[remote_snapshot_path],
-                remove_remote_after_download_paths=[remote_pcap_path],
-            )
-            LOG.info("Downloaded %s", local_path)
-            return local_path
-        finally:
-            second_client.close()
+        if session_name is None or remote_pcap_path is None:
+            raise RuntimeError("tcpdump session state was not initialized.")
+        stop_tcpdump(ssh_transport, session_name, remote_pcap_path, config)
+        wait_for_remote_pcap_to_settle(ssh_transport, remote_pcap_path, config)
+        remote_snapshot_path = create_remote_download_snapshot(
+            ssh_transport,
+            remote_pcap_path,
+        )
+        local_path = download_remote_pcap(
+            ssh_transport,
+            remote_snapshot_path,
+            local_dir,
+            bool(config["local"].get("remove_remote_after_download", False)),
+            local_filename=Path(remote_pcap_path).name,
+            always_remove_remote_paths=[remote_snapshot_path],
+            remove_remote_after_download_paths=[remote_pcap_path],
+        )
+        LOG.info("Downloaded %s", local_path)
+        return local_path
     except Exception:
-        best_effort_cleanup(config, config_dir, session_name)
+        best_effort_cleanup(config, config_dir, session_name, remote_pcap_path)
         raise
 
 
