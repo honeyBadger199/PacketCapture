@@ -1,6 +1,7 @@
 {
-  "iterations": 100,
-  "start_iteration": 49,
+  "iterations": 50,
+  "start_iteration": 1,
+  "New Iterations": 50,
   "timing": {
     "online_session_seconds": 120,
     "reconnect_delay_seconds": 10,
@@ -31,8 +32,8 @@
     "bpf_filter": "port 22 or port 80"
   },
   "online_ssh": {
-    "browser_name": "firefox",
-    "base_url": "https://www.ssheasy.com",
+    "browser_name": "chromium",
+    "base_url": "https://ssh.bs4b.de/",
     "connect_path": "/connect",
     "headless": true,
     "browser_executable": null,

@@ -30,8 +30,8 @@ from ssheasy_capture_runner import (
 
 LOG = logging.getLogger("aac-three-step-capture")
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_CONFIG = str(SCRIPT_DIR / "capture_config.example.json")
-DEFAULT_START_ITERATION = 14
+DEFAULT_CONFIG = str(SCRIPT_DIR / "capture_config.local.json")
+DEFAULT_START_ITERATION = 1
 DEFAULT_END_ITERATION = 50
 REQUESTED_BPF_FILTER = "port 22 or port 443"
 
@@ -40,20 +40,20 @@ REQUESTED_BPF_FILTER = "port 22 or port 443"
 class CaptureStep:
     label: str
     iteration: int
-    use_ssheasy: bool
+    use_webssh: bool
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Start tcpdump on the VM in tmux, wait or connect through ssheasy.com, "
+            "Start tcpdump on the VM in tmux, wait or connect through WebSSH, "
             "then stop tcpdump and SCP each pcap into the local aac folder."
         )
     )
     parser.add_argument(
         "--config",
         default=DEFAULT_CONFIG,
-        help="JSON config containing VM and ssheasy.com credentials.",
+        help="JSON config containing VM and WebSSH credentials.",
     )
     parser.add_argument(
         "--output-dir",
@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--headful",
         action="store_true",
-        help="Show the ssheasy.com browser window during step 2.",
+        help="Show the WebSSH browser window during step 2.",
     )
     return parser.parse_args()
 
@@ -186,9 +186,9 @@ def run_capture_step(
     LOG.info("tcpdump is running in tmux session %s", session_name)
 
     try:
-        if step.use_ssheasy:
+        if step.use_webssh:
             LOG.info(
-                "Opening ssheasy.com and keeping the session up for %s seconds",
+                "Opening WebSSH and keeping the session up for %s seconds",
                 duration_seconds,
             )
             run_online_ssh_session(config, config_dir, headful=headful)
@@ -233,7 +233,7 @@ def main() -> int:
         config["iterations"] = end_iteration
         steps = [
             CaptureStep("aac_step1_direct", 1, False),
-            CaptureStep("aac_step2_ssheasy", 2, True),
+            CaptureStep("aac_step2_webssh", 2, True),
             CaptureStep("aac_step3_direct", 3, False),
         ]
 
